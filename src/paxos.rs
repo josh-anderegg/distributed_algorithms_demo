@@ -4,7 +4,6 @@ use std::{fmt::Debug, sync::{Arc, Mutex}, usize::MAX};
 use rand::{self, rngs::StdRng, Rng};
 use server::Server;
 use client::Client;
-use crate::Node;
 
 const WAIT_DURATION : usize = 50;
 
@@ -38,10 +37,10 @@ impl Debug for Command {
     }
 }
 
-// pub enum Node {
-//     Server(Server),
-//     Client(Client)
-// }
+pub enum Node {
+    Server(Server),
+    Client(Client)
+}
 
 enum Action {
     Store{var : String, value : String},
@@ -67,7 +66,7 @@ impl history::Action for Action{
 
 
 pub struct System {
-    nodes : Vec<Box<dyn Node>>,
+    nodes : Vec<Node>,
     network : Network<Message>,
     servers : Arc<Mutex<Vec<usize>>>
 }
@@ -170,13 +169,13 @@ impl System {
 }
 
 
-// impl Node {
-//     pub fn exec(&mut self, actor : &mut Actor) {
-//         match self  {
-//             Node::Client(client) => client.exec(actor),
-//             Node::Server(server) => server.exec(actor)
-//         };
-//     }
+impl Node {
+    pub fn exec(&mut self, actor : &mut Actor) {
+        match self  {
+            Node::Client(client) => client.exec(actor),
+            Node::Server(server) => server.exec(actor)
+        };
+    }
 
-// }
+}
 
