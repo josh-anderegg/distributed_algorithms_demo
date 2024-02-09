@@ -1,5 +1,5 @@
 use crate::communication::{CommModel, Link, Network, Packet};
-use crate::history::{self, Actor, History, Iteration};
+use crate::history::{self, Actor, History, Iteration, TrackHistory};
 use std::{fmt::Debug, sync::{Arc, Mutex}, usize::MAX};
 use rand::{self, rngs::StdRng, Rng};
 use server::Server;
@@ -71,9 +71,9 @@ pub struct System {
     servers : Arc<Mutex<Vec<usize>>>
 }
 
-impl System {
-
-    pub fn new_rand(node_count : usize, server_count : usize, rng : &mut StdRng) -> Self {
+impl crate::System for System {
+    
+    fn new_rand(node_count : usize, server_count : usize, rng : &mut StdRng) -> Self {
         let network = Network::new(CommModel::Asynchronous, node_count, rng);
         let mut id = 0;
         let mut nodes = Vec::new();
@@ -93,14 +93,14 @@ impl System {
         System {nodes, network, servers}
     }
 
-    pub fn simulate(&mut self, rounds : Option<usize>, history : &mut dyn History) {
+    fn simulate(&mut self, rounds : Option<usize>, history : &mut TrackHistory) {
         let rounds = match rounds {
             Some(nr) => nr,
             None => MAX,
         };
 
         let mut iteration_nr = 0 ;
-        while !self.servers_decided() && (rounds == MAX || iteration_nr < rounds){
+        while !self.decided() && (rounds == MAX || iteration_nr < rounds){
             let mut iteration = Iteration::new(iteration_nr);
             
             self.network.exchange_messages();
@@ -115,6 +115,35 @@ impl System {
             iteration_nr += 1;
         }
 
+    }
+
+    fn decided(&self) -> bool {
+        for node in self.nodes.iter() {
+            match node {
+                Node::Server(server) => if !server.has_decided() {
+                    return false
+                } ,
+                _ => (),
+            }
+        }
+        true
+    }
+    
+
+}
+
+impl System {
+
+    pub fn client_commands(&self) -> Vec<Command> {
+        let mut ret = Vec::new();
+        for node in self.nodes.iter() {
+            match node {
+                Node::Client(client) => ret.push(client.get_command()),
+                _ => (),
+            }
+        }
+
+        return ret
     }
 
     pub fn servers_agree(&self) -> Option<Command> {
@@ -141,33 +170,7 @@ impl System {
         }
         any_command
     }
-
-    pub fn servers_decided(&self) -> bool {
-        for node in self.nodes.iter() {
-            match node {
-                Node::Server(server) => if !server.has_decided() {
-                    return false
-                } ,
-                _ => (),
-            }
-        }
-        true
-    }
-
-    pub fn client_commands(&self) -> Vec<Command> {
-        let mut ret = Vec::new();
-        for node in self.nodes.iter() {
-            match node {
-                Node::Client(client) => ret.push(client.get_command()),
-                _ => (),
-            }
-        }
-
-        return ret
-    }
-
 }
-
 
 impl Node {
     pub fn exec(&mut self, actor : &mut Actor) {
@@ -179,3 +182,59 @@ impl Node {
 
 }
 
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use crate::System;
+
+    #[test]
+    fn paxos_rng_is_deterministic() {
+        let seed = 64;
+        let mut rng1 = StdRng::seed_from_u64(seed);
+        let system1:paxos::System = System::new_rand(20, 2, &mut rng1);
+        let mut rng2 = StdRng::seed_from_u64(seed);
+        let system2:paxos::System = System::new_rand(20, 2, &mut rng2);
+        assert_eq!(system1.client_commands(), system2.client_commands());
+    }
+
+    #[test]
+    fn paxos_3(){
+        let seed = 32;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut system:paxos::System = System::new_rand(3, 1, &mut rng);
+        let mut history = TrackHistory::new();
+        system.simulate(None, &mut history);
+    }
+
+    #[test]
+    fn paxos_terminates(){
+        let seed = 420;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut system:paxos::System = System::new_rand(3, 1, &mut rng);
+        let mut history = TrackHistory::new();
+        system.simulate(None, &mut history);
+    }
+
+    #[test]
+    fn paxos_agrees(){
+        let seed = 420;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut system:paxos::System = System::new_rand(3, 1, &mut rng);
+        let mut history = TrackHistory::new();
+        system.simulate(None, &mut history);
+        assert!(system.servers_agree() != None)
+    }
+
+    #[test]
+    fn paxos_valid_history(){
+        let seed = 420;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut system:paxos::System = System::new_rand(3, 1, &mut rng);
+        let mut history = TrackHistory::new();
+        system.simulate(None, &mut history);
+    }
+}
