@@ -1,16 +1,20 @@
-use crate::communication::{CommModel, Link, Network, Packet};
-use crate::history::{self, Actor, History, Iteration, TrackHistory};
-use std::{fmt::Debug, sync::{Arc, Mutex}, usize::MAX};
+pub mod client;
+pub mod server;
+
+use super::Logger;
+use crate::network::{Link, Network, Packet};
+use client::Client;
+use rand::SeedableRng;
 use rand::{self, rngs::StdRng, Rng};
 use server::Server;
-use client::Client;
+use std::{cell::RefCell, fmt::Debug, rc::Rc, usize::MAX};
 
-const WAIT_DURATION : usize = 50;
-
-mod server;
-mod client;
-
+const WAIT_DURATION: usize = 50;
+const SERVER: usize = 0;
+const CLIENT: usize = 1;
 type Ticket = usize;
+type ServerList = Rc<RefCell<Vec<usize>>>;
+type LinkInterface = Rc<RefCell<Link<Message>>>;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Message {
@@ -18,13 +22,13 @@ pub enum Message {
     Ok(Ticket, Command),
     Propose(Ticket, Command),
     Success,
-    Execute(Command)
+    Execute(Command),
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Command {
     Defined(bool),
-    Undefined
+    Undefined,
 }
 
 impl Debug for Command {
@@ -37,134 +41,136 @@ impl Debug for Command {
     }
 }
 
-pub enum Node {
-    Server(Server),
-    Client(Client)
+trait Node {
+    fn exec(&mut self, logger: &mut Logger);
+    fn get_command(&self) -> Command;
+    fn has_decided(&self) -> bool;
+    fn get_type(&self) -> usize;
 }
-
 enum Action {
-    Store{var : String, value : String},
-    Send{receiver_id : usize, message: Message},
-    StateChange{from : usize, to : usize},
-    Receive{sender_id : usize, message : Message},
-    Check{condition : String, values : String, result : bool},
-    Decide{command : Command}
+    Store(String, String),
+    Send(usize, Message),
+    StateChange(usize, usize),
+    Receive(usize, Message),
+    Check(String, String, bool),
+    Decide(Command),
 }
 
-impl history::Action for Action{
-    fn as_string(&self) -> String {
+impl Debug for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Action::Store { var, value } => format!("store {var} = {value}"),
-            Action::Send { receiver_id, message } => format!("send {message:?} to {receiver_id}"),
-            Action::StateChange { from, to } => format!("change state from {from} to {to}"),
-            Action::Receive { sender_id, message } => format!("received {message:?} from {sender_id}"),
-            Action::Check { condition, values, result } => format!("check {condition}: {values} => {result}"),
-            Action::Decide { command } => format!("decides for {command:?}"),
+            Self::Store(var, value) => write!(f, "store {var} = {value}"),
+            Self::Send(receiver_id, message) => write!(f, "send {message:?} to {receiver_id}"),
+            Self::StateChange(from, to) => write!(f, "change state from {from} to {to}"),
+            Self::Receive(sender_id, message) => {
+                write!(f, "received {message:?} from {sender_id}")
+            }
+            Self::Check(condition, values, result) => {
+                write!(f, "check {condition}: {values} => {result}")
+            }
+            Self::Decide(command) => write!(f, "decides for {command:?}"),
         }
     }
 }
 
-
 pub struct System {
-    nodes : Vec<Node>,
-    network : Network<Message>,
-    servers : Arc<Mutex<Vec<usize>>>
+    nodes: Vec<Box<dyn Node>>,
+    network: Network<Message>,
 }
 
 impl crate::System for System {
-    
-    fn new_rand(node_count : usize, server_count : usize, rng : &mut StdRng) -> Self {
-        let network = Network::new(CommModel::Asynchronous, node_count, rng);
+    fn new_rand(node_count: usize, server_count: usize, seed: Option<u64>) -> Self {
+        let mut rng = match seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => StdRng::from_entropy(),
+        };
+
+        let network = Network::new(true, node_count, seed, 10);
         let mut id = 0;
-        let mut nodes = Vec::new();
-        let servers = Arc::new(Mutex::new(Vec::new()));
+        let mut nodes: Vec<Box<dyn Node>> = Vec::new();
+        let servers = Rc::new(RefCell::new(Vec::with_capacity(server_count)));
 
         while id < server_count {
-            nodes.push(Node::Server(Server::new(id, network.get_link(id))));
-            servers.lock().unwrap().push(id);
+            nodes.push(Box::new(Server::new(id, network.get_link_ref(id))));
+            servers.borrow_mut().push(id);
             id += 1
         }
 
         while id < node_count {
-            nodes.push(Node::Client(Client::new_rand(id, network.get_link(id), servers.clone(), rng)));
+            nodes.push(Box::new(Client::new_rand(
+                id,
+                network.get_link_ref(id),
+                servers.clone(),
+                &mut rng,
+            )));
             id += 1
         }
 
-        System {nodes, network, servers}
+        System { nodes, network }
     }
 
-    fn simulate(&mut self, rounds : Option<usize>, history : &mut TrackHistory) {
-        let rounds = match rounds {
+    fn simulate(&mut self, max_rounds: Option<usize>, log: Option<&str>) {
+        let max_rounds = match max_rounds {
             Some(nr) => nr,
             None => MAX,
         };
 
-        let mut iteration_nr = 0 ;
-        while !self.decided() && (rounds == MAX || iteration_nr < rounds){
-            let mut iteration = Iteration::new(iteration_nr);
-            
+        let mut logger = Logger::new(log);
+
+        let mut cur_round = 0;
+        while !self.decided() && cur_round < max_rounds {
+            logger.log_round(cur_round);
             self.network.exchange_messages();
-            
-            for (id, node) in self.nodes.iter_mut().enumerate(){
-                let mut actor = Actor::new(id);
-                node.exec(&mut actor);
-                iteration.track(actor)
+            for (_, node) in self.nodes.iter_mut().enumerate() {
+                node.exec(&mut logger);
             }
 
-            history.track(iteration);
-            iteration_nr += 1;
+            cur_round += 1;
         }
-
     }
 
     fn decided(&self) -> bool {
         for node in self.nodes.iter() {
-            match node {
-                Node::Server(server) => if !server.has_decided() {
-                    return false
-                } ,
-                _ => (),
+            if !node.has_decided() {
+                return false;
             }
         }
         true
     }
-    
-
 }
 
 impl System {
-
     pub fn client_commands(&self) -> Vec<Command> {
         let mut ret = Vec::new();
         for node in self.nodes.iter() {
-            match node {
-                Node::Client(client) => ret.push(client.get_command()),
+            match node.get_type() {
+                CLIENT => ret.push(node.get_command()),
                 _ => (),
             }
         }
 
-        return ret
+        return ret;
     }
 
     pub fn servers_agree(&self) -> Option<Command> {
         let mut any_command = None;
-        for node in self.nodes.iter(){
-            match node {
-                Node::Server(server) => {
-                    any_command = Some(server.get_command());
-                    break
-                },
+        for node in self.nodes.iter() {
+            match node.get_type() {
+                SERVER => {
+                    any_command = Some(node.get_command());
+                    break;
+                }
                 _ => (),
             }
         }
-        
-        for node in self.nodes.iter(){
-            match node {
-                Node::Server(server) => {
-                    if server.get_command() != any_command.unwrap() {
-                        return None
+
+        for node in self.nodes.iter() {
+            match node.get_type() {
+                SERVER => {
+                    if node.get_command() != any_command.unwrap() {
+                        return None;
                     }
-                },
+                }
                 _ => (),
             }
         }
@@ -172,69 +178,43 @@ impl System {
     }
 }
 
-impl Node {
-    pub fn exec(&mut self, actor : &mut Actor) {
-        match self  {
-            Node::Client(client) => client.exec(actor),
-            Node::Server(server) => server.exec(actor)
-        };
-    }
-
-}
-
-
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::*;
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
     use crate::System;
+    use crate::*;
 
     #[test]
     fn paxos_rng_is_deterministic() {
-        let seed = 64;
-        let mut rng1 = StdRng::seed_from_u64(seed);
-        let system1:paxos::System = System::new_rand(20, 2, &mut rng1);
-        let mut rng2 = StdRng::seed_from_u64(seed);
-        let system2:paxos::System = System::new_rand(20, 2, &mut rng2);
+        let seed = 42;
+        let system1: paxos::System = System::new_rand(20, 2, Some(seed));
+        let system2: paxos::System = System::new_rand(20, 2, Some(seed));
         assert_eq!(system1.client_commands(), system2.client_commands());
     }
 
     #[test]
-    fn paxos_3(){
-        let seed = 32;
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut system:paxos::System = System::new_rand(3, 1, &mut rng);
-        let mut history = TrackHistory::new();
-        system.simulate(None, &mut history);
+    fn paxos_3() {
+        let mut system: paxos::System = System::new_rand(3, 1, None);
+        system.simulate(None, Some("paxos_3"));
     }
 
     #[test]
-    fn paxos_terminates(){
+    fn paxos_terminates() {
         let seed = 420;
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut system:paxos::System = System::new_rand(3, 1, &mut rng);
-        let mut history = TrackHistory::new();
-        system.simulate(None, &mut history);
+        let mut system: paxos::System = System::new_rand(3, 1, Some(seed));
+        system.simulate(None, Some("paxos_terminates"));
     }
 
     #[test]
-    fn paxos_agrees(){
-        let seed = 420;
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut system:paxos::System = System::new_rand(3, 1, &mut rng);
-        let mut history = TrackHistory::new();
-        system.simulate(None, &mut history);
+    fn paxos_agrees() {
+        let mut system: paxos::System = System::new_rand(3, 1, None);
+        system.simulate(None, Some("paxos_agrees"));
         assert!(system.servers_agree() != None)
     }
 
     #[test]
-    fn paxos_valid_history(){
+    fn paxos_valid_history() {
         let seed = 420;
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut system:paxos::System = System::new_rand(3, 1, &mut rng);
-        let mut history = TrackHistory::new();
-        system.simulate(None, &mut history);
+        let mut system: paxos::System = System::new_rand(3, 1, Some(seed));
+        system.simulate(None, Some("paxos_valid"));
     }
 }
